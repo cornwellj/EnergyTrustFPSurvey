@@ -1,0 +1,36 @@
+---
+title: "EnergyTrustFireplaceAnalysis"
+author: "John Cornwell"
+date: "February 7, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+install.packages("readstata13")
+library(readstata13)
+```
+
+
+```{r }
+
+ETO_Rnd1 <- read.dta13("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Wave1AnalysisDataset.dta",convert.factors = TRUE, generate.factors = FALSE,
+  encoding = "UTF-8", fromEncoding = NULL, convert.underscore = FALSE,
+  missing.type = FALSE, convert.dates = TRUE, replace.strl = TRUE,
+  add.rownames = FALSE, nonint.factors = FALSE)
+
+
+
+summary(ETO_Rnd1)
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
