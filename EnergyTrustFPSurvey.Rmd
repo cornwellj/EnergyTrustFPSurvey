@@ -9,22 +9,87 @@ output: html_document
 knitr::opts_chunk$set(echo = TRUE)
 install.packages("readstata13")
 library(readstata13)
+library(dplyr)
+library(reshape2)
 ```
 
 
 ```{r }
 
-ETO_Rnd1 <- read.dta13("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Wave1AnalysisDataset.dta",convert.factors = TRUE, generate.factors = FALSE,
+ETO_Rnd1 <- read.dta13("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/FinalAnalysisDataset.dta",convert.factors = TRUE, generate.factors = FALSE,
   encoding = "UTF-8", fromEncoding = NULL, convert.underscore = FALSE,
   missing.type = FALSE, convert.dates = TRUE, replace.strl = TRUE,
   add.rownames = FALSE, nonint.factors = FALSE)
 
+ETO_Rnd1_Completed <- subset(ETO_Rnd1,ETO_Rnd1$ResCompleted == 1)
+
+summary(ETO_Rnd1_Completed$Q16A)
+
+Summary_HOU <- mutate(ETO_Rnd1_Completed, Decile = ntile(Q16A, 10))
+
+Summary_HOU %>% group_by(Decile) %>% summarise_each(funs(min,max),Q16A)
+
+# create bins for hours of use
+
+ETO_Rnd1_Completed$Q16A[is.na(ETO_Rnd1_Completed$Q16A)] <- 99
+
+ETO_Rnd1_Completed$HOU_Bins <- cut(ETO_Rnd1_Completed$Q16A, breaks=c(-1,0,3,5,10,15,20,97,98,99), labels=c("0","1-3","4-5","6-10","11-15","16-20",">20","Unknown","NA"))
+
+table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$S2)
+table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$Q5B_1)
+table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$surveywave)
 
 
-summary(ETO_Rnd1)
+table(ETO_Rnd1_Completed$HOU_Bins)
+zips <- as.data.frame(table(ETO_Rnd1$zip))
+zips$Zip5 <- as.character(zips$Var1)
+zips$Zip5 <- substr(zips$Zip5,1,5)
+zips <- as.data.frame(table(zips$Zip5))
+
+
+table(ETO_Rnd1_Completed$Q16A)
+
+write.csv(ETO_Rnd1_Completed, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/ETO_Final_Completed.csv")
+
+write.csv(zips, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/ETO_Final_zips.csv")
+
 
 ```
 
+## Get Weather Data
+
+```{r }
+## use rnoaa 
+install.packages('rnoaa')
+library(rnoaa)
+
+# create vector of GHCND IDs for ETO weather stations
+
+ETO_Weather_stations <- read.csv("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/EnergyTrust_WeatherStationData.csv")
+
+ETO_Weather_stations_GHCND <- select(ETO_Weather_stations, Source)
+
+ETO_Weather_stations_GHCND$Source <- sub(".*:", "", ETO_Weather_stations_GHCND$Source)
+
+test <- meteo_pull_monitors(ETO_Weather_stations_GHCND$Source, keep_flags = FALSE, date_min = NULL,
+  date_max = NULL, var = "all")
+
+test <- filter(test, date > as.Date("2016-12-31"))
+
+## Test if all ETO zips are in ETO data
+
+eto_zip_wst <- read.csv("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Zip_Wstation_ETO.csv")
+colnames(eto_zip_wst)[1] <- "Zip5"
+colnames(zips)[1] <- "Zip5"
+
+
+ETO_Rnd1_Completed$zip5 <- strtrim(ETO_Rnd1_Completed$zip,5)
+ETO_Rnd1_Completed$zip5
+
+eto_ziptest <- merge(zips, eto_zip_wst, by = 'Zip5', all.x = T)
+
+write.csv(eto_ziptest, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Zip_Test.csv")
+```
 ## Including Plots
 
 You can also embed plots, for example:
