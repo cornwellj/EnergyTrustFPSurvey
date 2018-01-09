@@ -11,91 +11,367 @@ install.packages("readstata13")
 library(readstata13)
 library(dplyr)
 library(reshape2)
+library(rnoaa)
+library(zoo)
+library(ggplot2)
+library(scales)
+library(geosphere)
+library(lubridate)
 ```
 
-
+## Load survey data
 ```{r }
-
+# Load data from stata file
 ETO_Rnd1 <- read.dta13("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/FinalAnalysisDataset.dta",convert.factors = TRUE, generate.factors = FALSE,
   encoding = "UTF-8", fromEncoding = NULL, convert.underscore = FALSE,
   missing.type = FALSE, convert.dates = TRUE, replace.strl = TRUE,
   add.rownames = FALSE, nonint.factors = FALSE)
 
+# select completed surveys - n= 473
 ETO_Rnd1_Completed <- subset(ETO_Rnd1,ETO_Rnd1$ResCompleted == 1)
 
+# ANALYZE HOU 
 summary(ETO_Rnd1_Completed$Q16A)
 
 Summary_HOU <- mutate(ETO_Rnd1_Completed, Decile = ntile(Q16A, 10))
 
-Summary_HOU %>% group_by(Decile) %>% summarise_each(funs(min,max),Q16A)
-
+Summary_HOU <- Summary_HOU %>% group_by(Decile) %>% summarise_each(funs(min,max),Q16A)
+Summary_HOU
 # create bins for hours of use
 
 ETO_Rnd1_Completed$Q16A[is.na(ETO_Rnd1_Completed$Q16A)] <- 99
 
 ETO_Rnd1_Completed$HOU_Bins <- cut(ETO_Rnd1_Completed$Q16A, breaks=c(-1,0,3,5,10,15,20,97,98,99), labels=c("0","1-3","4-5","6-10","11-15","16-20",">20","Unknown","NA"))
 
+# decile by survey by own/rent
 table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$S2)
+# decile by survey by heating type main
 table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$Q5B_1)
+# decile by survey by survey wave
 table(ETO_Rnd1_Completed$HOU_Bins,ETO_Rnd1_Completed$surveywave)
-
-
+# by bin
 table(ETO_Rnd1_Completed$HOU_Bins)
+
+# extract zis or review and comparison with weather
 zips <- as.data.frame(table(ETO_Rnd1$zip))
 zips$Zip5 <- as.character(zips$Var1)
 zips$Zip5 <- substr(zips$Zip5,1,5)
 zips <- as.data.frame(table(zips$Zip5))
 
-
-table(ETO_Rnd1_Completed$Q16A)
-
 write.csv(ETO_Rnd1_Completed, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/ETO_Final_Completed.csv")
 
 write.csv(zips, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/ETO_Final_zips.csv")
 
-
+write.csv(ETO_Rnd1_Modeling, "/Users/cornwell/Documents/_Projects/1_Closed_Projects/ETO Fireplaces 2/2016-2017 Survey/ETO_Final_Modeling.csv")
 ```
 
-## Get Weather Data
+## Get Weather Data using Energy Trust preferred weather stations
 
 ```{r }
 ## use rnoaa 
 install.packages('rnoaa')
 library(rnoaa)
+options(noaakey = "vpGewbchlKkAHlJUzrXTsXRwJtNzLWev")
+
 
 # create vector of GHCND IDs for ETO weather stations
 
 ETO_Weather_stations <- read.csv("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/EnergyTrust_WeatherStationData.csv")
-
 ETO_Weather_stations_GHCND <- select(ETO_Weather_stations, Source)
-
 ETO_Weather_stations_GHCND$Source <- sub(".*:", "", ETO_Weather_stations_GHCND$Source)
 
-test <- meteo_pull_monitors(ETO_Weather_stations_GHCND$Source, keep_flags = FALSE, date_min = NULL,
-  date_max = NULL, var = "all")
+ETO_Weather_stations_GHCND <- filter(ETO_Weather_stations_GHCND, ETO_Weather_stations_GHCND$Source != "Average of Neighbors")
 
-test <- filter(test, date > as.Date("2016-12-31"))
+ETO_Weather_stations_GHCND_unique <- unique(ETO_Weather_stations_GHCND$Source)
+
+
+# Pull weather data
+ghcnd_clear_cache(force = TRUE)
+fullwth <- meteo_pull_monitors(ETO_Weather_stations_GHCND_unique, keep_flags = FALSE, date_min = NULL,date_max = NULL, var = "all")
+
+ptwth<- filter(fullwth, fullwth$date > as.Date("2016-12-01"))
+
+# convert temps from tenths degrees C to F
+
+ptwth$tavg <- (ptwth$tavg/10)*(9/5)+32
+ptwth$tmax <- (ptwth$tmax/10)*(9/5)+32
+ptwth$tmin <- (ptwth$tmin/10)*(9/5)+32
+
+## create HDD for each day based on average temp, min temp, max temp base - 
+
+ptwth$HDDavg <- abs(60 - ptwth$tavg)
+ptwth$HDDmin <- abs(60 - ptwth$tmin)
+ptwth$HDDmax <- abs(60 - ptwth$tmax)
+
+## create var with hdd for sum of each seven day period
+
+ptwth = ptwth %>%
+  group_by(id) %>%
+  arrange(id, date) %>%
+  mutate(HDDavgsum = rollsum(x = HDDavg, 7, align = "right", fill = NA),
+        HDDminsum = rollsum(x = HDDmin, 7, align = "right", fill = NA),
+        HDDmaxsum = rollsum(x = HDDmax, 7, align = "right", fill = NA),
+        precsum = rollsum(x = prcp, 7, align = "right", fill = NA), 
+        snowsum = rollsum(x = snow, 7, align = "right", fill = NA))
+
+## create id to link to survey
+
+ptwth$idjoin <- paste(ptwth$id, ptwth$date) 
+
+## merge weather data with survey data
+
+# change date formate to date
+ETO_Rnd1_Completed$date <- as.Date(ETO_Rnd1_Completed$DATE_START, "%Y%m%d")
+
+# merge on weather station by zip/
+
+eto_zip_wst <- read.csv("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Zip_Wstation_ETO.csv")
+colnames(eto_zip_wst)[1] <- "zip5"
+colnames(zips)[1] <- "zip5"
 
 ## Test if all ETO zips are in ETO data
 
-eto_zip_wst <- read.csv("/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Zip_Wstation_ETO.csv")
-colnames(eto_zip_wst)[1] <- "Zip5"
-colnames(zips)[1] <- "Zip5"
+eto_zip_wst$zip5 <- as.character(eto_zip_wst$zip5)
+ETO_Rnd1_Completed$zip5a <- strtrim(ETO_Rnd1_Completed$zip,5)
+ETO_Rnd1_Completed$zip5 <- ETO_Rnd1_Completed$zip5a
 
+## manual lookup for NA values to find closest zip. 
+ETO_Rnd1_Completed$zip5 <- ifelse(ETO_Rnd1_Completed$zip5a =="97003", "97006", ETO_Rnd1_Completed$zip5a)
+ETO_Rnd1_Completed$zip5 <- ifelse(ETO_Rnd1_Completed$zip5a =="97078", "97007", ETO_Rnd1_Completed$zip5)
+ETO_Rnd1_Completed$zip5 <- ifelse(ETO_Rnd1_Completed$zip5a =="97703", "97701", ETO_Rnd1_Completed$zip5)
 
-ETO_Rnd1_Completed$zip5 <- strtrim(ETO_Rnd1_Completed$zip,5)
-ETO_Rnd1_Completed$zip5
+table(ETO_Rnd1_Completed$zip5)
 
-eto_ziptest <- merge(zips, eto_zip_wst, by = 'Zip5', all.x = T)
+## merge ETO station IDs
 
-write.csv(eto_ziptest, "/Users/cornwell/Documents/_Projects/ETO Fireplaces/2016-2017 Survey/Zip_Test.csv")
+ETO_Rnd1_Completed <- merge(ETO_Rnd1_Completed, eto_zip_wst, by = 'zip5', all.x = T)
+
+## merge GHCND numbers
+ETO_Weather_stations_GHCND <- select(ETO_Weather_stations, Source, WeatherStationId)
+ETO_Weather_stations_GHCND$Source <- sub(".*:", "", ETO_Weather_stations_GHCND$Source)
+ETO_Weather_stations_GHCND_unique <- unique(ETO_Weather_stations_GHCND)
+ETO_Weather_stations_GHCND_unique <- filter(ETO_Weather_stations_GHCND_unique, ETO_Weather_stations_GHCND_unique$Source != "Average of Neighbors")
+ETO_Rnd1_Completed <- merge(ETO_Rnd1_Completed, ETO_Weather_stations_GHCND_unique, by.x =  "WeatherStationID", by.y = "WeatherStationId")
+
+## merge in weather data
+ETO_Rnd1_Completed$idjoin <- paste(ETO_Rnd1_Completed$Source, ETO_Rnd1_Completed$date) 
+
+ETO_Rnd1_Completed_Wth <- merge(ETO_Rnd1_Completed, ptwth, by = "idjoin")
+
+summary(ETO_Rnd1_Completed_Wth)
+
+# create modeling dataset
+
+ETO_Rnd1_Modeling <- select(ETO_Rnd1_Completed_Wth, idjoin, WeatherStationID, program, sqft, surveywave, S2, S4, Q5B_1, Q5C, Q5E, Q5F, Q6A, Q6B, Q7, Q8A, Q8AO,Q8B, Q9A, Q9B, Q10A, Q10BM1, Q10BM2, Q10BM3, Q10BM4, Q10BO, Q11, Q12, Q14, Q14O, Q15A, Q16A, Q16B, Q17, Q18AM1, Q18AM2, Q18AM3, Q18AM4, Q18AO, Q18BM1, Q18BM2, Q18BM3, Q18BM4, Q18BO, HDDavgsum, HDDminsum, HDDmaxsum,precsum, snowsum)
+
+ETO_Rnd1_Modeling$Q15A <- as.numeric(ETO_Rnd1_Modeling$Q15A)
+ETO_Rnd1_Modeling$Q16A <- ifelse((ETO_Rnd1_Modeling$Q16A == 98 | ETO_Rnd1_Modeling$Q16A == 99), NA, ETO_Rnd1_Modeling$Q16A)
+
+## create wth condition vars
+
+ETO_Rnd1_Modeling$precipbinary <- ifelse(ETO_Rnd1_Modeling$precsum > 0, 1,0)
+ETO_Rnd1_Modeling$snowbinary <- ifelse(ETO_Rnd1_Modeling$snowsum > 0, 1,0)
+
+## create day length
+
+ETO_Rnd1_Modeling$dayyr <- yday(ETO_Rnd1_Modeling$SurveyDate)
+ETO_Rnd1_Modeling$dayyr
+
+ETO_Rnd1_Modeling$daylengthPDX <- daylength(45,ETO_Rnd1_Modeling$dayyr)
 ```
-## Including Plots
 
-You can also embed plots, for example:
+# statistics
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+```{r }
+
+## compare pop and sample
+
+table(ETO_Rnd1$state)
+table(ETO_Rnd1$heatsysfuel)
+mean(ETO_Rnd1$sqft, na.rm = T)
+ETO_Rnd1$circa <- as.numeric(ETO_Rnd1$circa)
+mean(ETO_Rnd1$circa, na.rm = T)
+
+# table of hours of use
+# histogram of usage above 0 for all, thos who heat with GF, those who do not use for heat
+ggplot(ETO_Rnd1_Modeling,aes(x=Q16A)) + 
+    geom_histogram(data=ETO_Rnd1_Modeling,fill = "dark green", alpha = 0.6, binwidth = 1) + scale_colour_brewer(palette="Set1") +  labs (x="Seven-Day Hours of Use", y = "Count of Observations")+ stat_bin(binwidth=1, geom="text", aes(label=..count..), vjust=-1.5) 
+
+
+ggplot(ETO_Rnd1_Modeling,aes(x=Q16A)) + geom_histogram(data=subset(ETO_Rnd1_Modeling,Q16A==0),fill = "dark green", alpha = 0.6, binwidth = 1) + stat_bin(binwidth=1, geom="text", aes(label=..count..), vjust=-1.5) 
+
+
+
+
+
+ggplot(ETO_Rnd1_Modeling, aes(x=Q16A, y=(..count..)/sum(..count..), fill=factor(surveywave))) +
+ geom_histogram(position="identity", alpha=1, binwidth = 2) + facet_grid(surveywave ~ .) + scale_y_continuous(labels=percent)+ 
+  labs (x="Seven Day Hours of Use", y = "Percent of Observations",
+         fill="Survey Wave") + scale_colour_brewer(palette="Set1") + theme_bw()
+
+# Histogram Colored (blue and red)
+hist(h1, col=rgb(1,0,0,0.5),xlim=c(0,10), ylim=c(0,200), main=”Overlapping Histogram”, xlab=”Variable”)
+hist(h2, col=rgb(0,0,1,0.5), add=T)
+box()
+
+# histogram of use for elec vs gas for all
+hist <- subset(ETO_Rnd1_Modeling, Q16A > 0)
+hist(hist$Q16A)
+
+usetable1 <- filter(ETO_Rnd1_Modeling, Q8A_analysis !=4) %>%
+  summarise(mean=mean(Q16A,na.rm=T),sd=sd(Q16A,na.rm=T),n=n(), ns=sum(!is.na(Q16A)))
+usetable1$se <- usetable1$sd/(sqrt(usetable1$n))
+
+usetable1 <- ETO_Rnd1_Modeling %>% group_by(surveywave) %>%
+  summarise(mean=mean(Q16A,na.rm=T),sd=sd(Q16A,na.rm=T),n=n(), ns=sum(!is.na(Q16A)))
+usetable1$se <- usetable1$sd/(sqrt(usetable1$n))
+
+filter(ETO_Rnd1_Modeling, Q16A > 0)
+
+dat <- data.frame(xx = c(runif(100,20,50),runif(100,40,80),runif(100,0,30)),yy = rep(letters[1:3],each = 100))
+
+ETO_Rnd1_Modeling$Q8A_analysis <- as.numeric(ETO_Rnd1_Modeling$Q8A_analysis)
+
+## box plots
+boxplot <- ggplot(filter(ETO_Rnd1_Modeling, Q8A_analysis < 4), aes(x=Q8A_analysis, y=Q16A, fill=factor(Q8A_analysis))) + geom_boxplot() +
+   stat_summary(fun.data = n, geom = "text", fun.y = median) +  
+  stat_summary(fun.x = mean, geom = "point", colour = "blue", linetype = 2, size = 2)  +
+  stat_summary(fun.x=mean, colour="blue", geom="text", show_guide = FALSE, vjust=.4, hjust = -.4, aes( label=round(..y.., digits=1)))  + 
+  stat_summary(fun.data = mean_cl_normal, geom = "errorbar", width = 0.2) +  
+  labs (x="Fireplace User Type", y = "Seven-Day Hours of Use") + scale_colour_brewer(palette="Set1") + theme_bw() + theme(legend.position = "none")
+
+boxplot
+
+boxplot +  scale_x_continuous(breaks = c(1, 2, 3), labels=c("Heat Only \n n=64", "Ambiance Only\n n=116", "Ambiance and Heat\n n=193"))
+ggsave("pltWH2.pdf", width = 6, height = 3.5, units = "in", dpi = 800)
+
+table(ETO_Rnd1_Modeling$Q8A_analysis
+      )
+
+ggplot(data = filter(ETO_Rnd1_Modeling, Q8A_analysis != 4 & Q16A == 0), aes(x = Q16A, fill = factor(Q8A_analysis, labels = c("Heat Only \n n=64", "Ambiance Only\n n=116", "Ambiance and Heat\n n=193")))) + geom_bar() + coord_flip() + scale_y_reverse(expand=(c(0,0))) + scale_x_discrete(c(0,0))+ labs (y = "Percent of Observations with Zero Observations", fill = "Fireplace Usage Type")+ scale_colour_brewer(palette="Set1")+stat_bin(geom = "text",
+          aes(label = paste(round((..count..)/sum(..count..)*100), "%"), hjust = 0),
+          position = position_stack(vjust = .15))+ stat_bin(geom = "text",
+          aes(label = paste("n=",(..count..)), hjust = 0, vjust =2),
+          position = position_stack(vjust = .15)) + theme(axis.title.y=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(), legend.position = "bottom", axis.text.x = element_blank())
+ggsave("pltWH.pdf", width = 6, height = 3.5, units = "in", dpi = 600)
+
+
+#histograms
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A, fill=factor(surveywave))) +
+ geom_dotplot(position="identity", alpha=1, binwidth = 2) + facet_grid(surveywave ~ .) + scale_y_continuous(labels=percent)+ 
+  labs (x="Average HDD", y = "Percent of Observations",
+         fill="Survey Wave") + scale_colour_brewer(palette="Set1") + theme_bw()
+
+ggplot(ETO_Rnd1_Modeling, aes(x = Q16A, color = factor(Q8A_analysis, labels = c("Heat Only", "Decoration \nor Ambiance Only", "Heat and Ambiance", "Do Not Use")))) + geom_histogram(position="identity", alpha=.8, binwidth = 1) +  facet_grid(Q8A_analysis ~ .) + labs (x="Average HDD", y = "Percent of Observations", color = "Fireplace Usage Type")+ scale_colour_brewer(palette="Set1") + theme_bw()
+## scatterplot
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A, fill=factor(surveywave))) +
+ geom_dotplot(position="identity", alpha=1, binwidth = 2) + facet_grid(surveywave ~ .) + scale_y_continuous(labels=percent)+ 
+  labs (x="Average HDD", y = "Percent of Observations",
+         fill="Survey Wave") + scale_colour_brewer(palette="Set1") + theme_bw()
+## scattterplot 2a
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A)) +
+ geom_point(position = "identity")+ geom_smooth(method = "lm") + labs (x="Average HDD", y = "Seven Day Hours of Use") + scale_colour_brewer(palette="Set1") + theme_bw()
+## scattterplot 2b
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A, fill=factor(surveywave))) +
+ geom_point(position = "identity", aes(col = factor(surveywave)))+ geom_smooth(method = "lm", se = FALSE, aes(col = factor(surveywave))) + labs (x="Average HDD", y = "Seven Day Hours of Use") + scale_colour_brewer(palette="Set1") + theme_bw()
+
+## scattterplot 3
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A, fill=factor(surveywave))) +
+ geom_point(position = "identity", aes(col = factor(surveywave)))+ geom_smooth(method = "lm", formula = y~log(x), se = FALSE, aes(col = factor(surveywave))) + labs (x="Average HDD", y = "Seven Day Hours of Use") + scale_colour_brewer(palette="Set1") + theme_bw()
+
+## scattterplot 4
+
+ggplot(ETO_Rnd1_Modeling, aes(x = HDDavgsum, y = Q16A, color = factor(Q8A_analysis, labels = c("Heat Only", "Decoration \nor Ambiance Only", "Heat and Ambiance", "Do Not Use")))) + geom_point() + labs(color = "Number of gear") + geom_smooth(method = "lm", se = FALSE) + labs (x="Average HDD", y = "Seven Day Hours of Use", color = "Fireplace \nUsage Type")+ scale_colour_brewer(palette="Set1") + theme_bw()
+
+## scattterplot 5
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum, y=Q16A, fill=factor(surveywave))) +
+ geom_point(position = "identity", aes(col = factor(surveywave)))+ geom_smooth(method = "lm", formula = y~log(x), se = FALSE, aes(col = factor(surveywave))) + labs (x="Average HDD", y = "Seven Day Hours of Use", color = "Fireplace Useage Type") + scale_colour_brewer(palette="Set1") + theme_bw()
+
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+## Modeling
+```{r }
+
+## create other model vars
+
+ETO_Rnd1_Modeling$Heatuse <- ifelse((ETO_Rnd1_Modeling$Q8A == 1|ETO_Rnd1_Modeling$Q8A == 3),1,0)
+ETO_Rnd1_Modeling$FPuse <- ifelse((ETO_Rnd1_Modeling$Q8A == 1|ETO_Rnd1_Modeling$Q8A == 3|ETO_Rnd1_Modeling$Q8A == 2),1,0)
+ETO_Rnd1_Modeling$FPuse <- ifelse((ETO_Rnd1_Modeling$Q8A == 4),1,0)
+ETO_Rnd1_Modeling$heatuse2 <- ifelse((ETO_Rnd1_Modeling$Q8A == 2|ETO_Rnd1_Modeling$Q8A == 3|ETO_Rnd1_Modeling$Q8A == 2),1,0)
+
+  
+# run basic model.
+
+summary(ETO_Rnd1_Modeling)
+table(hist$Q8A)
+
+
+## 1st model HOU ~ HDD + E on all
+
+Model1 <- lm(Q16A ~ HDDavgsum + precsum + Heatuse + daylengthPDX, ETO_Rnd1_Modeling)
+summary(Model1)
+plot(Model1)
+
+## 2nd model HOU~ HDD + E on use over 0
+
+Model1 <- lm(Q16A ~ HDDavgsum, daylengthPDX, ETO_Rnd1_Modeling, Q16A > 0))
+summary(Model1)
+plot(Model1)
+plot.new
+abline(Model1)
+
+## 3rd model HOU~ HDD + E on use over 0
+
+Model1 <- lm(Q16A ~ HDDavgsum, filter(ETO_Rnd1_Modeling, Q16A > 0))
+summary(Model1)
+plot(Model1)
+plot.new
+abline(Model1)
+
+```
+# There were 9 zips that did not match. Manually matched to zip that does not appear in ETO list
+# with new zip that does match based on geographic proximity (assgigned closest zip with wether  #station) 
+
+## Merge weather data with customer survey data 
+```{r }
+
+## First assign manually researched zips for zips missing weather station ETO preferred
+# Create 
+
+ETO_Rnd1_Completed$Zip5 <- substr(ETO_Rnd1_Completed$zip,1,5)
+zips <- as.data.frame(table(ETO_Rnd1_Completed$Zip5))
+
+ziptest <- filter(ETO_Rnd1_Completed, is.na(ETO_Rnd1_Completed$WeatherStationID))
+ziptest <- select(ziptest, zip5)
+
+table(ETO_Rnd1_Completed$zip5, ETO_Rnd1_Completed$WeatherStationID)
+```
+
+## scattterplots for poster
+```{r }
+
+ETOpallette <- c("#41C4DD", "#BABBAC", "#006595", "#BAAF31")
+
+ggplot(ETO_Rnd1_Modeling, aes(x = HDDavgsum, y = Q16A, color = factor(Q8A_analysis, labels = c("Heat Only", "Decoration \nor Ambiance Only", "Heat and Ambiance", "Do Not Use")))) + geom_point() + labs(color = "Number of gear") + geom_smooth(method = "lm", se = FALSE) + labs (x="Average HDD", y = "Seven Day Hours of Use", color = "Fireplace \nUsage Type")+ scale_color_manual(values=ETOpallette) + theme_bw()
+ggsave("poster1.pdf", width = 6, height = 3.5, units = "in", dpi = 800)
+
+
+
+ggplot(ETO_Rnd1_Modeling, aes(x=HDDavgsum)) +   geom_histogram(aes(y=2*..density.., fill=as.factor(Q8A_analysis)), position="identity", alpha=1, binwidth = 2, colour = NA) + scale_y_continuous(labels=percent_format(), name="Frequency (%)")+ facet_grid(Q8A_analysis ~.) + 
+  labs (x="Average HDD", y = "Percent of Observations",
+         fill="Fireplace \nUsage Type") + theme_bw() + scale_fill_manual(values=ETOpallette) 
+ggsave("poster2.pdf", width = 6, height = 3.5, units = "in", dpi = 800)
+
+## scattterplot 2a
+
+
+
+```
